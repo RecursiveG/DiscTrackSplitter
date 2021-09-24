@@ -28,6 +28,7 @@ flags.DEFINE_string(
     "cover", None, "Album cover file, search order similar to --cue. "
     "Set to empty string to disable cover: \"--cover=\".")
 flags.DEFINE_string("output", None, "The audio files will be put in \"<output>/<performer>/<album_name>\"")
+flags.DEFINE_string("format", "flac", "The output format. Can be 'fdkaac' or 'flac'")
 
 # metadata
 flags.DEFINE_list("cue_encoding", "utf8,gbk,shift-jis", "A list of file encodings to try.")
@@ -322,6 +323,37 @@ def fdkaac_cmd(cue_dict, track_index: int):
     return ret
 
 
+def flac_cmd(cue_dict, track_index: int, embed_cover_art: Optional[str] = None):
+    # index starts from 1
+    track_dict = cue_dict["TRACK_LIST"][track_index - 1]
+
+    # shnsplit replaces / with -
+    # if the title ends with a dot, shnsplit doesn't add an extra dot to deliminate stem and ext.
+    fname_stem_in = "{}.{}".format(str(track_index).zfill(2), track_dict["TITLE_RAW"].replace('/', '-'))
+    fname_stem_out = "{}.{}".format(str(track_index).zfill(2), track_dict["TITLE"].replace('/', '-'))
+    if fname_stem_in[-1] == '.':
+        fname_stem_in = fname_stem_in[:-1]
+    if fname_stem_out[-1] == '.':
+        fname_stem_out = fname_stem_out[:-1]
+
+    ret = ["flac", "--silent", "-o", f"{fname_stem_out}.flac"]
+    ret += ["--tag=TITLE=" + track_dict["TITLE"]]
+    ret += ["--tag=PERFORMER=" + track_dict["PERFORMER"]]
+    if embed_cover_art is not None:
+        ret += [f"--picture={embed_cover_art}"]
+
+    ret += ["--tag=ALBUM=" + cue_dict["TITLE"]]
+    if "REM DATE" in cue_dict:
+        ret += ["--tag=DATE=" + cue_dict["REM DATE"]]
+    if "REM GENRE" in cue_dict:
+        ret += ["--tag=GENRE=" + cue_dict["REM GENRE"]]
+    ret += ["--tag=ARTIST=" + cue_dict["PERFORMER"]]
+    ret += [f"--tag=TRACKNUMBER={track_index}"]
+
+    ret.append(f"wav/{fname_stem_in}.wav")
+    return ret
+
+
 def convert_img(cover: Path, dst: Path):
     # determine image aspect ratio
     img = Image.open(cover)
@@ -371,19 +403,35 @@ def do_split(wav: Path, cue_dict: dict, cue_content: str, cover: Optional[Path])
     # split into wav
     os.chdir(dst_dir_wav)
     subprocess.run(["shntool", "split", "-t", '%n.%t', "-o", 'wav', str(wav)], input=cue_content.encode(), check=True)
-    # convert each into m4a
-    os.chdir(dst_dir)
-    m4a_converters = [subprocess.Popen(fdkaac_cmd(cue_dict, x + 1)) for x in range(len(cue_dict["TRACK_LIST"]))]
-    for proc in m4a_converters:
-        proc.wait()
-        assert proc.returncode == 0
-    # remove wav
-    shutil.rmtree(dst_dir_wav)
     # create cover
     if cover:
         convert_img(cover, dst_dir)
+    else:
+        assert not FLAGS.embed_cover_art, "no cover art to embed"
+    # convert each file into final format
+    os.chdir(dst_dir)
+    if FLAGS.format == "flac":
+        print("Converting to FLAC...")
+        cover_f = None
+        if FLAGS.embed_cover_art:
+            cover_f = "cover.jpg"
+        converters = [subprocess.Popen(flac_cmd(cue_dict, x + 1, cover_f)) for x in range(len(cue_dict["TRACK_LIST"]))]
+        for proc in converters:
+            proc.wait()
+            assert proc.returncode == 0
+    elif FLAGS.format == "fdkaac":
+        converters = [subprocess.Popen(fdkaac_cmd(cue_dict, x + 1)) for x in range(len(cue_dict["TRACK_LIST"]))]
+        for proc in converters:
+            proc.wait()
+            assert proc.returncode == 0
+        if FLAGS.embed_cover_art:
+            subprocess.run(["bash", '-c', "mp4art --add cover.jpg *.m4a"], check=True)
+    else:
+        assert False, "Format not known:" + FLAGS.format
+    # remove wav
+    shutil.rmtree(dst_dir_wav)
     if FLAGS.embed_cover_art:
-        subprocess.run(["bash", '-c', "mp4art --add cover.jpg *.m4a"], check=True)
+        os.remove(dst_dir / "cover.jpg")
 
 
 def main(argv):
